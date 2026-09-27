@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../platform io/artnet_test"
+		},
+		{
+			"name": "Artnet",
+			"path": "."
+		}
+	],
+	"settings": {}
+}
