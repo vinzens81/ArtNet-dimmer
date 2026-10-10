@@ -15,12 +15,13 @@ static const uint16_t ARTNET_PORT = 6454;
 
 // ── Dimmer (LR7843 N-Kanal Logic-Level MOSFET, per PWM angesteuert) ───────────
 static const uint8_t  MOSFET_PIN        = D1;
-static const bool     MOSFET_ACTIVE_LOW = false; // MOSFET zieht Last gegen GND -> Gate high = an
+static const bool     MOSFET_ACTIVE_LOW = false; // LED-Leiste: + an +28V, - an Load -> Eingang high = an
 static const uint16_t PWM_RANGE         = 1023;  // ESP8266 macht PWM in Software: bei 1 kHz ist
 static const uint16_t PWM_FREQUENCY_HZ  = 1000;  // ~1000 Stufen die Auflösungsgrenze
 static const float    GAMMA             = 2.2f;  // Wahrnehmung ist logarithmisch -> LUT statt linear
 
-// Faellt die Quelle aus, geht der Ausgang aus (Art-Net empfiehlt ~4 s).
+// Faellt die Quelle laenger als das aus, gilt DMX als verloren (Anzeige/ArtPollReply);
+// der Ausgang haelt dabei den zuletzt empfangenen Wert.
 static const uint32_t DMX_TIMEOUT_MS = 4000;
 
 // Ein OLED-Refresh dauert ~25 ms, DMX kommt alle ~23 ms: das Display darf
@@ -66,6 +67,12 @@ static const uint32_t DR_TIMEOUT_MS = 4000;
 
 bool          doubleResetPending = false;
 unsigned long bootMillis         = 0;
+
+// WLAN-Reset aus dem Web-UI: erst die HTTP-Antwort rausschicken, dann loeschen
+// und neu starten (sonst sieht der Browser nur einen Verbindungsabbruch).
+static const uint32_t WIFI_RESET_DELAY_MS = 500;
+bool     wifiResetPending = false;
+uint32_t wifiResetAtMs    = 0;
 
 Config           cfg;
 ESP8266WebServer server(80);
@@ -172,7 +179,7 @@ void buildGammaLut() {
 
 uint8_t activeValue() {
     if (manualMode) return manualValue;
-    return dmxLive ? dmxValue : 0;
+    return dmxValue; // bei DMX-Ausfall bleibt der letzte Wert stehen
 }
 
 uint16_t dutyForValue(uint8_t value) {
@@ -307,7 +314,7 @@ void showSplashScreen() {
     display.display();
 }
 
-void showWifiResetScreen() {
+void showWifiResetScreen(const char* reason) {
     if (!oledOk) return;
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -317,7 +324,7 @@ void showWifiResetScreen() {
     display.print("WLAN-Reset");
 
     display.setCursor(0, 26);
-    display.print("Doppel-Reset erkannt");
+    display.print(reason);
     display.setCursor(0, 38);
     display.print("WLAN-Daten werden");
     display.setCursor(0, 48);
@@ -379,6 +386,7 @@ input[type=range]{width:100%}
 button{width:100%;padding:10px;margin-top:12px;background:#0070f3;color:#fff;
   border:none;border-radius:4px;font-size:1em;cursor:pointer}
 button.alt{background:#777}
+button.warn{background:#c62828}
 .hint{font-weight:normal;color:#666}
 #msg{text-align:center;color:green;min-height:1.3em}
 </style></head><body>
@@ -407,6 +415,11 @@ button.alt{background:#777}
   <input type="number" name="fade" min="0" max="5000">
   <button>Speichern</button>
 </fieldset></form>
+<fieldset><legend>WLAN</legend>
+  <span class="hint">L&ouml;scht die WLAN-Zugangsdaten und startet neu. Danach mit
+  &bdquo;ArtNet-Setup&ldquo; verbinden und das WLAN neu einrichten.</span>
+  <button class="warn" id="wr">WLAN neu einrichten</button>
+</fieldset>
 <p id="msg"></p>
 <script>
 const $=i=>document.getElementById(i);
@@ -431,6 +444,10 @@ $('rel').onclick=()=>{hold=false;fetch('/set?auto=1');};
 $('f').onsubmit=async ev=>{ev.preventDefault();
  await fetch('/save',{method:'POST',body:new URLSearchParams(new FormData($('f')))});
  $('msg').textContent='Gespeichert!';setTimeout(()=>{$('msg').textContent=''},2000);};
+$('wr').onclick=async()=>{
+ if(!confirm('WLAN-Zugangsdaten l\u00f6schen und neu starten?'))return;
+ try{await fetch('/wifireset',{method:'POST'});}catch(err){}
+ $('msg').textContent='Neustart \u2014 jetzt mit \u201eArtNet-Setup\u201c verbinden';};
 setInterval(poll,500);poll();
 </script></body></html>)HTML";
 
@@ -479,6 +496,24 @@ void handleSet() {
     setTarget(activeValue());
     displayDirty = true;
     server.send(200, "application/json", "{\"ok\":1}");
+}
+
+void handleWifiReset() {
+    server.send(200, "application/json", "{\"ok\":1}");
+    wifiResetPending = true;
+    wifiResetAtMs    = millis();
+}
+
+void serviceWifiReset() {
+    if (!wifiResetPending || millis() - wifiResetAtMs < WIFI_RESET_DELAY_MS) return;
+    Serial.println("WLAN-Reset per Web-UI — loesche Zugangsdaten und starte neu");
+    setTarget(0);
+    writeDuty(0);
+    showWifiResetScreen("Reset per Web-UI");
+    WiFiManager wm;
+    wm.resetSettings();
+    delay(1500);
+    ESP.restart();
 }
 
 // ── ArtNet ────────────────────────────────────────────────────────────────────
@@ -565,8 +600,7 @@ void serviceDmxTimeout() {
     if (!dmxLive || millis() - lastDmxMs <= DMX_TIMEOUT_MS) return;
     dmxLive      = false;
     displayDirty = true;
-    Serial.println("DMX-Ausfall — Ausgang aus");
-    if (!manualMode) setTarget(0);
+    Serial.printf("DMX-Ausfall — halte letzten Wert %u\n", dmxValue);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -602,7 +636,7 @@ void setup() {
     WiFiManager wm;
     if (doubleResetPending) {
         Serial.println("Doppel-Reset erkannt — loesche WLAN-Zugangsdaten");
-        showWifiResetScreen();
+        showWifiResetScreen("Doppel-Reset erkannt");
         wm.resetSettings();
         delay(1500);
     }
@@ -623,6 +657,7 @@ void setup() {
     server.on("/status", HTTP_GET,  handleStatus);
     server.on("/set",    HTTP_GET,  handleSet);
     server.on("/save",   HTTP_POST, handleSave);
+    server.on("/wifireset", HTTP_POST, handleWifiReset);
     server.begin();
 
     String host = hostName();
@@ -682,4 +717,5 @@ void loop() {
     serviceFade();
     serviceDmxTimeout();
     serviceDisplay();
+    serviceWifiReset();
 }
